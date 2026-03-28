@@ -913,7 +913,9 @@
             }
         }
 
-        async search() {
+        async search(attempt = 0) {
+            const MAX_SEARCH_RETRIES = 3;
+
             let API_SEARCH_URL;
             if (this.options.guildId === '@me') API_SEARCH_URL = `https://discord.com/api/v9/channels/${this.options.channelId}/messages/`; // DMs
             else API_SEARCH_URL = `https://discord.com/api/v9/guilds/${this.options.guildId}/messages/`; // Server
@@ -953,8 +955,15 @@
                 });
                 this.afterRequest();
             } catch (err) {
+                if (attempt < MAX_SEARCH_RETRIES) {
+                    const retryDelay = this.options.searchDelay;
+                    log.warn(`Search request failed: ${err.message}. Retrying in ${retryDelay}ms... (${attempt + 1}/${MAX_SEARCH_RETRIES})`);
+                    await this._wait(retryDelay);
+                    if (!this.state.running) return { total_results: 0, messages: [] };
+                    return await this.search(attempt + 1);
+                }
                 this.state.running = false;
-                log.error('Search request threw an error:', err);
+                log.error('Search request threw an error after all retries:', err);
                 throw err;
             }
 
