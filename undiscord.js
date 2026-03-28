@@ -697,6 +697,8 @@
             etr: 0,
         };
 
+        _waitCancel = null; // function to cancel a pending _wait()
+
         // events
         onStart = undefined;
         onProgress = undefined;
@@ -848,7 +850,7 @@
 
                 // wait before next page (fix search page not updating fast enough)
                 log.verb(`Waiting ${(this.options.searchDelay / 1000).toFixed(2)}s before next page...`);
-                await wait(this.options.searchDelay);
+                await this._wait(this.options.searchDelay);
 
             } while (this.state.running);
 
@@ -862,7 +864,23 @@
 
         stop() {
             this.state.running = false;
+            if (this._waitCancel) {
+                this._waitCancel();
+                this._waitCancel = null;
+            }
             if (this.onStop) this.onStop(this.state, this.stats);
+        }
+
+        /** Cancellable wait — resolved early when stop() is called */
+        async _wait(ms) {
+            return new Promise(resolve => {
+                const id = setTimeout(resolve, ms);
+                this._waitCancel = () => {
+                    clearTimeout(id);
+                    this._waitCancel = null;
+                    resolve();
+                };
+            });
         }
 
         /** Calculate the estimated time remaining based on the current stats */
@@ -947,7 +965,8 @@
                 this.stats.throttledCount++;
                 this.stats.throttledTotalTime += w;
                 log.warn(`This channel isn't indexed yet. Waiting ${w}ms for discord to index it...`);
-                await wait(w);
+                await this._wait(w);
+                if (!this.state.running) return;
                 return await this.search();
             }
 
@@ -965,7 +984,8 @@
                     this.printStats();
                     log.verb(`Cooling down for ${w * 2}ms before retrying...`);
 
-                    await wait(w * 2);
+                    await this._wait(w * 2);
+                    if (!this.state.running) return;
                     return await this.search();
                 }
                 else {
@@ -1035,7 +1055,7 @@
                     if (result === 'RETRY') {
                         attempt++;
                         log.verb(`Retrying in ${this.options.deleteDelay}ms... (${attempt}/${this.options.maxAttempt})`);
-                        await wait(this.options.deleteDelay);
+                        await this._wait(this.options.deleteDelay);
                     }
                     else break;
                 }
@@ -1043,7 +1063,7 @@
                 this.calcEtr();
                 if (this.onProgress) this.onProgress(this.state, this.stats);
 
-                await wait(this.options.deleteDelay);
+                await this._wait(this.options.deleteDelay);
             }
         }
 
@@ -1077,7 +1097,7 @@
                     log.warn(`Being rate limited by the API for ${w}ms! Adjusted delete delay to ${this.options.deleteDelay}ms.`);
                     this.printStats();
                     log.verb(`Cooling down for ${w * 2}ms before retrying...`);
-                    await wait(w * 2);
+                    await this._wait(w * 2);
                     return 'RETRY';
                 } else {
                     const body = await resp.text();
