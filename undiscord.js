@@ -568,7 +568,7 @@
                         <a href="{{WIKI}}/delay" title="Help" target="_blank" rel="noopener noreferrer">help</a>
                     </legend>
                     <div class="input-wrapper">
-                        <input id="deleteDelay" type="range" value="1000" step="50" min="50" max="10000">
+                        <input id="deleteDelay" type="range" value="1250" step="50" min="50" max="10000">
                         <div id="deleteDelayValue"></div>
                     </div>
                     <br>
@@ -1732,6 +1732,15 @@ body.undiscord-pick-message.after [id^="message-content-"]:hover::after {
         $('button#getToken').onclick = () => $('input#token').value = fillToken();
 
         // sync delays
+        const syncModeDeleteDelay = () => {
+            const delay = $('select#deletionMode').value === 'alternating' ? 1250 : 1000;
+            $('input#deleteDelay').value = delay;
+            $('div#deleteDelayValue').textContent = delay + 'ms';
+            undiscordCore.options.deleteDelay = delay;
+        };
+        $('select#deletionMode').onchange = syncModeDeleteDelay;
+        syncModeDeleteDelay();
+
         $('input#searchDelay').onchange = (e) => {
             const v = parseInt(e.target.value);
             if (v) undiscordCore.options.searchDelay = v;

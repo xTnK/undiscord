@@ -13,6 +13,9 @@ Choose **Advanced settings > Deletion order** before starting:
   pausing between batches. The delete delay and API rate limit / indexing waits
   still apply.
 
+Changing the mode resets the delete delay to 1250ms for **Alternate new and old**,
+or 1000ms for either other mode. You can adjust it afterward.
+
 Alternating mode skips duplicate IDs from overlapping pages, including when fewer
 than 50 messages remain or Discord's search index still returns deleted messages.
 Messages already removed elsewhere are skipped without counting them as failures.
