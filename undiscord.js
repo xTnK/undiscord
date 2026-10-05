@@ -164,7 +164,8 @@
 #undiscord input[type="password"],
 #undiscord input[type="datetime-local"],
 #undiscord input[type="number"],
-#undiscord input[type="range"] {
+#undiscord input[type="range"],
+#undiscord select {
   background-color: var(--ud-input-bg);
   border: 1px solid var(--ud-input-border);
   border-radius: 8px;
@@ -539,6 +540,19 @@
             <details>
                 <summary>Advanced settings</summary>
                 <fieldset>
+                    <legend>Deletion order</legend>
+                    <div class="input-wrapper">
+                        <select id="deletionMode" class="input">
+                            <option value="newest">Newest first</option>
+                            <option value="oldest">Oldest first</option>
+                            <option value="alternating" selected>Alternate new and old</option>
+                        </select>
+                    </div>
+                    <div class="sectionDescription">
+                        Deletes 25 newest, then 25 oldest, without pausing between batches.
+                    </div>
+                </fieldset>
+                <fieldset>
                     <legend>
                         Search delay
                         <a href="{{WIKI}}/delay" title="Help" target="_blank" rel="noopener noreferrer">help</a>
@@ -664,6 +678,7 @@
             includeNsfw: null, // Search in NSFW channels
             includePinned: null, // Delete messages that are pinned
             pattern: null, // Only delete messages that match the regex (insensitive)
+            deletionMode: 'alternating', // newest, oldest, or alternating batches of 25
             searchDelay: null, // Delay each time we fetch for more messages
             deleteDelay: null, // Delay between each delete operation
             maxAttempt: 2, // Attempts to delete a single message if it fails
@@ -675,15 +690,20 @@
             delCount: 0,
             failCount: 0,
             grandTotal: 0,
-            offset: 0,
             iterations: 0,
 
-            // cursor-based pagination to bypass stale search index
+            // Each direction advances independently through the search index.
+            _searchDirection: 'desc',
             _cursorMaxId: null,
+            _cursorMinId: null,
+            _exhaustedDirections: new Set(),
+            _deletedMessageIds: new Set(),
+            _sweepHadCandidates: false,
             _restartCount: 0,
             _maxRestarts: 10,
 
             _seachResponse: null,
+            _discoveredMessages: [],
             _messagesToDelete: [],
             _skippedMessages: [],
         };
@@ -710,14 +730,19 @@
                 delCount: 0,
                 failCount: 0,
                 grandTotal: 0,
-                offset: 0,
                 iterations: 0,
 
+                _searchDirection: 'desc',
                 _cursorMaxId: null,
+                _cursorMinId: null,
+                _exhaustedDirections: new Set(),
+                _deletedMessageIds: new Set(),
+                _sweepHadCandidates: false,
                 _restartCount: 0,
                 _maxRestarts: 10,
 
                 _seachResponse: null,
+                _discoveredMessages: [],
                 _messagesToDelete: [],
                 _skippedMessages: [],
             };
@@ -758,6 +783,7 @@
             if (this.state.running && !isJob) return log.error('Already running!');
 
             this.state.running = true;
+            this.state._searchDirection = this.options.deletionMode === 'oldest' ? 'asc' : 'desc';
             this.stats.startTime = new Date();
 
             log.success(`\nStarted at ${this.stats.startTime.toLocaleString()}`);
@@ -769,6 +795,7 @@
                 `maxId = "${redact(this.options.maxId)}"`,
                 `hasLink = ${!!this.options.hasLink}`,
                 `hasFile = ${!!this.options.hasFile}`,
+                `deletionMode = ${this.options.deletionMode}`,
             );
 
             if (this.onStart) this.onStart(this.state, this.stats);
@@ -779,6 +806,7 @@
                 log.verb('Fetching messages...');
                 // Search messages
                 await this.search();
+                if (!this.state.running) break;
 
                 // Process results and find which messages should be deleted
                 await this.filterResponse();
@@ -788,7 +816,7 @@
                     `(Messages in current page: ${this.state._seachResponse.messages.length}`,
                     `To be deleted: ${this.state._messagesToDelete.length}`,
                     `Skipped: ${this.state._skippedMessages.length})`,
-                    `offset: ${this.state.offset}`
+                    `direction: ${this.state._searchDirection}`
 	      );
                 this.printStats();
 
@@ -804,29 +832,30 @@
                         break; // immmediately stop this iteration
                     }
 
-                    // Track the smallest (oldest) message ID in this batch for cursor pagination
-                    const batchIds = this.state._messagesToDelete.map(m => BigInt(m.id));
-                    const smallestId = batchIds.reduce((a, b) => a < b ? a : b);
-                    this.state._cursorMaxId = smallestId.toString();
-
+                    this.state._sweepHadCandidates = true;
                     await this.deleteMessagesFromList();
-                    // Reset offset after deleting (cursor replaces offset-based pagination)
-                    this.state.offset = 0;
                 }
-                else if (this.state._skippedMessages.length > 0) {
-                    // There are stuff, but nothing to delete (example a page full of system messages)
-                    // check next page until we see a page with nothing in it (end of results).
-                    const oldOffset = this.state.offset;
-                    this.state.offset += this.state._skippedMessages.length;
-                    log.verb('There\'s nothing we can delete on this page, checking next page...');
-                    log.verb(`Skipped ${this.state._skippedMessages.length} out of ${this.state._seachResponse.messages.length} in this page.`, `(Offset was ${oldOffset}, ajusted to ${this.state.offset})`);
-                    // Don't update _cursorMaxId here — offset handles skipped messages
+                if (!this.state.running) break;
+
+                if (this.state._discoveredMessages.length > 0) {
+                    // Advance past every hit, including filtered and already deleted messages.
+                    // This prevents stale overlapping pages from stalling either direction.
+                    const ids = this.state._discoveredMessages.map(m => BigInt(m.id));
+                    if (this.state._searchDirection === 'asc') {
+                        this.state._cursorMinId = ids.reduce((a, b) => a > b ? a : b).toString();
+                    } else {
+                        this.state._cursorMaxId = ids.reduce((a, b) => a < b ? a : b).toString();
+                    }
+                } else {
+                    // A short page is not necessarily the last page; only an empty one is.
+                    this.state._exhaustedDirections.add(this.state._searchDirection);
                 }
-                else {
-                    // Empty page — either end of cursor sweep or truly done
-                    if (this.state._cursorMaxId !== null) {
-                        // We were in a cursor sweep and hit the end.
-                        // Restart from the top to catch any new messages.
+
+                const directions = this.options.deletionMode === 'alternating'
+                    ? ['desc', 'asc'] : [this.state._searchDirection];
+                if (directions.every(direction => this.state._exhaustedDirections.has(direction))) {
+                    if (this.state._sweepHadCandidates) {
+                        // Recheck the original interval for new messages and failed deletes.
                         this.state._restartCount++;
                         if (this.state._restartCount > this.state._maxRestarts) {
                             log.warn(`Reached maximum restart limit (${this.state._maxRestarts}). Stopping.`);
@@ -834,23 +863,32 @@
                             if (isJob) break;
                             this.state.running = false;
                         } else {
-                            log.verb(`Cursor sweep reached the end. Restarting from top to check for new messages... (restart ${this.state._restartCount}/${this.state._maxRestarts})`);
+                            log.verb(`Cursor sweep reached the end. Rechecking for remaining messages... (restart ${this.state._restartCount}/${this.state._maxRestarts})`);
                             this.state._cursorMaxId = null;
-                            this.state.offset = 0;
-                            // continue the loop — will fetch from the top again
+                            this.state._cursorMinId = null;
+                            this.state._exhaustedDirections.clear();
+                            this.state._sweepHadCandidates = false;
+                            this.state._searchDirection = this.options.deletionMode === 'oldest' ? 'asc' : 'desc';
                         }
                     } else {
-                        // Fresh search (no cursor) returned an empty page — truly done
-                        log.verb('Ended because a fresh search returned an empty page.');
+                        // Stale hits may remain, but a full sweep found nothing left to delete.
+                        log.verb('Ended because a full search sweep found no remaining messages to delete.');
                         log.verb('[End state]', this.state);
                         if (isJob) break; // break without stopping if this is part of a job
                         this.state.running = false;
                     }
+                } else if (this.options.deletionMode === 'alternating') {
+                    const nextDirection = this.state._searchDirection === 'desc' ? 'asc' : 'desc';
+                    if (!this.state._exhaustedDirections.has(nextDirection)) {
+                        this.state._searchDirection = nextDirection;
+                    }
                 }
 
                 // wait before next page (fix search page not updating fast enough)
-                log.verb(`Waiting ${(this.options.searchDelay / 1000).toFixed(2)}s before next page...`);
-                await this._wait(this.options.searchDelay);
+                if (this.state.running && this.options.deletionMode !== 'alternating') {
+                    log.verb(`Waiting ${(this.options.searchDelay / 1000).toFixed(2)}s before next page...`);
+                    await this._wait(this.options.searchDelay);
+                }
 
             } while (this.state.running);
 
@@ -885,7 +923,8 @@
 
         /** Calculate the estimated time remaining based on the current stats */
         calcEtr() {
-            this.stats.etr = (this.options.searchDelay * Math.round(this.state.grandTotal / 25)) + ((this.options.deleteDelay + this.stats.avgPing) * this.state.grandTotal);
+            const pageDelay = this.options.deletionMode === 'alternating' ? 0 : this.options.searchDelay;
+            this.stats.etr = (pageDelay * Math.round(this.state.grandTotal / 25)) + ((this.options.deleteDelay + this.stats.avgPing) * this.state.grandTotal);
         }
 
         /** As for confirmation in the beggining process */
@@ -923,27 +962,28 @@
             let resp;
             try {
                 this.beforeRequest();
-                // Determine effective max_id: use cursor if set, respect user's maxId as upper bound
-                let effectiveMaxId = undefined;
-                if (this.state._cursorMaxId && this.options.maxId) {
-                    // Use whichever is smaller (older) to stay within user's bounds
-                    const cursorSnowflake = toSnowflake(this.state._cursorMaxId);
-                    const userSnowflake = toSnowflake(this.options.maxId);
-                    effectiveMaxId = BigInt(cursorSnowflake) < BigInt(userSnowflake) ? cursorSnowflake : userSnowflake;
-                } else if (this.state._cursorMaxId) {
-                    effectiveMaxId = toSnowflake(this.state._cursorMaxId);
-                } else if (this.options.maxId) {
-                    effectiveMaxId = toSnowflake(this.options.maxId);
+                // Only the active direction's cursor narrows the user's original interval.
+                let effectiveMinId = this.options.minId ? toSnowflake(this.options.minId) : undefined;
+                let effectiveMaxId = this.options.maxId ? toSnowflake(this.options.maxId) : undefined;
+                if (this.state._searchDirection === 'asc' && this.state._cursorMinId) {
+                    const cursor = this.state._cursorMinId;
+                    effectiveMinId = effectiveMinId === undefined || BigInt(cursor) > BigInt(effectiveMinId)
+                        ? cursor : effectiveMinId;
+                } else if (this.state._searchDirection === 'desc' && this.state._cursorMaxId) {
+                    const cursor = this.state._cursorMaxId;
+                    effectiveMaxId = effectiveMaxId === undefined || BigInt(cursor) < BigInt(effectiveMaxId)
+                        ? cursor : effectiveMaxId;
                 }
 
                 resp = await fetch(API_SEARCH_URL + 'search?' + queryString([
                     ['author_id', this.options.authorId || undefined],
                     ['channel_id', (this.options.guildId !== '@me' ? this.options.channelId : undefined) || undefined],
-                    ['min_id', this.options.minId ? toSnowflake(this.options.minId) : undefined],
+                    ['min_id', effectiveMinId],
                     ['max_id', effectiveMaxId],
                     ['sort_by', 'timestamp'],
-                    ['sort_order', 'desc'],
-                    ['offset', this.state.offset],
+                    ['sort_order', this.state._searchDirection],
+                    ['limit', 25],
+                    ['offset', 0],
                     ['has', this.options.hasLink ? 'link' : undefined],
                     ['has', this.options.hasFile ? 'file' : undefined],
                     ['content', this.options.content || undefined],
@@ -970,7 +1010,7 @@
             // not indexed yet
             if (resp.status === 202) {
                 let w = (await resp.json()).retry_after * 1000;
-                w = w || this.stats.searchDelay; // Fix retry_after 0
+                w = w || this.options.searchDelay || 1000; // Fix retry_after 0
                 this.stats.throttledCount++;
                 this.stats.throttledTotalTime += w;
                 log.warn(`This channel isn't indexed yet. Waiting ${w}ms for discord to index it...`);
@@ -983,13 +1023,12 @@
                 // searching messages too fast
                 if (resp.status === 429) {
                     let w = (await resp.json()).retry_after * 1000;
-                    w = w || this.stats.searchDelay; // Fix retry_after 0
+                    w = w || this.options.searchDelay || 1000; // Fix retry_after 0
 
                     this.stats.throttledCount++;
                     this.stats.throttledTotalTime += w;
-                    this.stats.searchDelay += w; // increase delay
-                    w = this.stats.searchDelay;
-                    log.warn(`Being rate limited by the API for ${w}ms! Increasing search delay...`);
+                    this.options.searchDelay = Math.max(this.options.searchDelay || 0, w);
+                    log.warn(`Being rate limited by the API for ${w}ms! Adjusted search delay to ${this.options.searchDelay}ms.`);
                     this.printStats();
                     log.verb(`Cooling down for ${w * 2}ms before retrying...`);
 
@@ -1017,10 +1056,17 @@
             if (total > this.state.grandTotal) this.state.grandTotal = total;
 
             // search returns messages near the the actual message, only get the messages we searched for.
-            const discoveredMessages = data.messages.map(convo => convo.find(message => message.hit === true));
+            const pageIds = new Set();
+            const discoveredMessages = data.messages
+                .map(convo => convo.find(message => message.hit === true))
+                .filter(message => {
+                    if (!message || pageIds.has(message.id)) return false;
+                    pageIds.add(message.id);
+                    return true;
+                });
 
             // we can only delete some types of messages, system messages are not deletable.
-            let messagesToDelete = discoveredMessages;
+            let messagesToDelete = discoveredMessages.filter(msg => !this.state._deletedMessageIds.has(msg.id));
             messagesToDelete = messagesToDelete.filter(msg => msg.type === 0 || (msg.type >= 6 && msg.type <= 21));
             messagesToDelete = messagesToDelete.filter(msg => msg.pinned ? this.options.includePinned : true);
 
@@ -1032,9 +1078,10 @@
                 log.warn('Ignoring RegExp because pattern is malformed!', e);
             }
 
-            // create an array containing everything we skipped. (used to calculate offset for next searches)
-            const skippedMessages = discoveredMessages.filter(msg => !messagesToDelete.find(m => m.id === msg.id));
+            const candidateIds = new Set(messagesToDelete.map(msg => msg.id));
+            const skippedMessages = discoveredMessages.filter(msg => !candidateIds.has(msg.id));
 
+            this.state._discoveredMessages = discoveredMessages;
             this.state._messagesToDelete = messagesToDelete;
             this.state._skippedMessages = skippedMessages;
 
@@ -1045,6 +1092,7 @@
             for (let i = 0; i < this.state._messagesToDelete.length; i++) {
                 const message = this.state._messagesToDelete[i];
                 if (!this.state.running) return log.error('Stopped by you!');
+                if (this.state._deletedMessageIds.has(message.id)) continue;
 
                 log.debug(
                     // `${((this.state.delCount + 1) / this.state.grandTotal * 100).toFixed(2)}%`,
@@ -1058,8 +1106,9 @@
 
                 // Delete a single message (with retry)
                 let attempt = 0;
-                while (attempt < this.options.maxAttempt) {
+                while (this.state.running && attempt < this.options.maxAttempt) {
                     const result = await this.deleteMessage(message);
+                    if (!this.state.running) return;
 
                     if (result === 'RETRY') {
                         attempt++;
@@ -1072,11 +1121,13 @@
                 this.calcEtr();
                 if (this.onProgress) this.onProgress(this.state, this.stats);
 
+                if (!this.state.running) return;
                 await this._wait(this.options.deleteDelay);
             }
         }
 
         async deleteMessage(message) {
+            if (this.state._deletedMessageIds.has(message.id)) return 'ALREADY_DELETED';
             const API_DELETE_URL = `https://discord.com/api/v9/channels/${message.channel_id}/messages/${message.id}`;
             let resp;
             try {
@@ -1114,12 +1165,17 @@
                     try {
                         const r = JSON.parse(body);
 
+                        if (resp.status === 404 && r.code === 10008) {
+                            // The message was removed elsewhere while the search index was stale.
+                            this.state._deletedMessageIds.add(message.id);
+                            log.verb(`Message ${redact(message.id)} is already deleted. Skipping.`);
+                            return 'ALREADY_DELETED';
+                        }
+
                         if (resp.status === 400 && r.code === 50083) {
                             // 400 can happen if the thread is archived (code=50083)
-                            // in this case we need to "skip" this message from the next search
-                            // otherwise it will come up again in the next page (and fail to delete again)
-                            log.warn('Error deleting message (Thread is archived). Will increment offset so we don\'t search this in the next page...');
-                            this.state.offset++;
+                            // The page cursor will advance past this message.
+                            log.warn('Error deleting message (Thread is archived). Skipping for this search sweep...');
                             this.state.failCount++;
                             return 'FAIL_SKIP'; // Failed but we will skip it next time
                         }
@@ -1130,10 +1186,13 @@
                         return 'FAILED';
                     } catch (e) {
                         log.error(`Fail to parse JSON. API responded with status ${resp.status}!`, body);
+                        this.state.failCount++;
+                        return 'FAILED';
                     }
                 }
             }
 
+            this.state._deletedMessageIds.add(message.id);
             this.state.delCount++;
             return 'OK';
         }
@@ -1807,6 +1866,7 @@ body.undiscord-pick-message.after [id^="message-content-"]:hover::after {
         const minDate = $('input#minDate').value.trim();
         const maxDate = $('input#maxDate').value.trim();
         //advanced
+        const deletionMode = $('select#deletionMode').value;
         const searchDelay = parseInt($('input#searchDelay').value.trim());
         const deleteDelay = parseInt($('input#deleteDelay').value.trim());
 
@@ -1835,6 +1895,7 @@ body.undiscord-pick-message.after [id^="message-content-"]:hover::after {
             includeNsfw,
             includePinned,
             pattern,
+            deletionMode,
             searchDelay,
             deleteDelay,
             // maxAttempt: 2,
