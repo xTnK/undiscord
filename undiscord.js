@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            Undiscord
 // @description     Delete all messages in a Discord channel or DM (Bulk deletion)
-// @version         5.2.6
+// @version         5.2.7
 // @author          victornpb
 // @homepageURL     https://github.com/victornpb/undiscord
 // @supportURL      https://github.com/victornpb/undiscord/discussions
@@ -21,7 +21,7 @@
     'use strict';
 
     /* rollup-plugin-baked-env */
-    const VERSION = "5.2.6";
+    const VERSION = "5.2.7";
 
    var themeCss = (`
 /* undiscord window */
@@ -699,6 +699,8 @@
             _exhaustedDirections: new Set(),
             _deletedMessageIds: new Set(),
             _sweepHadCandidates: false,
+            _deleteDelayBeforeRateLimit: null,
+            _deleteRetryDelay: null,
             _restartCount: 0,
             _maxRestarts: 10,
 
@@ -725,6 +727,7 @@
         onStop = undefined;
 
         resetState() {
+            this.restoreDeleteDelay();
             this.state = {
                 running: false,
                 delCount: 0,
@@ -738,6 +741,8 @@
                 _exhaustedDirections: new Set(),
                 _deletedMessageIds: new Set(),
                 _sweepHadCandidates: false,
+                _deleteDelayBeforeRateLimit: null,
+                _deleteRetryDelay: null,
                 _restartCount: 0,
                 _maxRestarts: 10,
 
@@ -892,6 +897,7 @@
 
             } while (this.state.running);
 
+            this.restoreDeleteDelay();
             this.stats.endTime = new Date();
             log.success(`Ended at ${this.stats.endTime.toLocaleString()}! Total time: ${msToHMS(this.stats.endTime.getTime() - this.stats.startTime.getTime())}`);
             this.printStats();
@@ -902,6 +908,7 @@
 
         stop() {
             this.state.running = false;
+            this.restoreDeleteDelay();
             if (this._waitCancel) {
                 this._waitCancel();
                 this._waitCancel = null;
@@ -1106,14 +1113,25 @@
 
                 // Delete a single message (with retry)
                 let attempt = 0;
+                let postDeleteDelay = null;
                 while (this.state.running && attempt < this.options.maxAttempt) {
                     const result = await this.deleteMessage(message);
                     if (!this.state.running) return;
 
                     if (result === 'RETRY') {
                         attempt++;
-                        log.verb(`Retrying in ${this.options.deleteDelay}ms... (${attempt}/${this.options.maxAttempt})`);
-                        await this._wait(this.options.deleteDelay);
+                        const retryDelay = this.state._deleteRetryDelay || this.options.deleteDelay;
+                        this.state._deleteRetryDelay = null;
+                        if (attempt < this.options.maxAttempt) {
+                            log.verb(`Retrying in ${retryDelay}ms... (${attempt}/${this.options.maxAttempt})`);
+                            await this._wait(retryDelay);
+                        } else if (this.options.deletionMode === 'alternating') {
+                            // No retry remains, so apply the cooldown once before the next message.
+                            postDeleteDelay = retryDelay;
+                        } else {
+                            // Preserve the existing retry behavior for the other modes.
+                            await this._wait(retryDelay);
+                        }
                     }
                     else break;
                 }
@@ -1122,7 +1140,7 @@
                 if (this.onProgress) this.onProgress(this.state, this.stats);
 
                 if (!this.state.running) return;
-                await this._wait(this.options.deleteDelay);
+                await this._wait(postDeleteDelay || this.options.deleteDelay);
             }
         }
 
@@ -1152,12 +1170,22 @@
                     // deleting messages too fast
                     const w = (await resp.json()).retry_after * 1000;
                     this.stats.throttledCount++;
-                    this.stats.throttledTotalTime += w;
-                    this.options.deleteDelay = w; // increase delay
-                    log.warn(`Being rate limited by the API for ${w}ms! Adjusted delete delay to ${this.options.deleteDelay}ms.`);
-                    this.printStats();
-                    log.verb(`Cooling down for ${w * 2}ms before retrying...`);
-                    await this._wait(w * 2);
+                    if (this.options.deletionMode === 'alternating') {
+                        const retryDelay = Math.max(2000, w || 0);
+                        this.stats.throttledTotalTime += retryDelay;
+                        this.activateTemporaryDeleteDelay(2000);
+                        this.state._deleteRetryDelay = retryDelay;
+                        log.warn(`Being rate limited by the API! Temporarily using a 2000ms delete delay until the next successful deletion.`);
+                        if (retryDelay > 2000) log.verb(`Discord requested a longer cooldown of ${retryDelay}ms for this retry.`);
+                        this.printStats();
+                    } else {
+                        this.stats.throttledTotalTime += w;
+                        this.options.deleteDelay = w; // increase delay
+                        log.warn(`Being rate limited by the API for ${w}ms! Adjusted delete delay to ${this.options.deleteDelay}ms.`);
+                        this.printStats();
+                        log.verb(`Cooling down for ${w * 2}ms before retrying...`);
+                        await this._wait(w * 2);
+                    }
                     return 'RETRY';
                 } else {
                     const body = await resp.text();
@@ -1194,7 +1222,24 @@
 
             this.state._deletedMessageIds.add(message.id);
             this.state.delCount++;
+            this.restoreDeleteDelay(true);
             return 'OK';
+        }
+
+        activateTemporaryDeleteDelay(delay) {
+            if (this.state._deleteDelayBeforeRateLimit === null) {
+                this.state._deleteDelayBeforeRateLimit = this.options.deleteDelay;
+            }
+            this.options.deleteDelay = delay;
+        }
+
+        restoreDeleteDelay(wasSuccessful = false) {
+            const previousDelay = this.state?._deleteDelayBeforeRateLimit;
+            if (previousDelay === null || previousDelay === undefined) return;
+            this.options.deleteDelay = previousDelay;
+            this.state._deleteDelayBeforeRateLimit = null;
+            this.state._deleteRetryDelay = null;
+            if (wasSuccessful) log.verb(`Successful deletion. Restored delete delay to ${previousDelay}ms.`);
         }
 
         #beforeTs = 0; // used to calculate latency
